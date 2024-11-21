@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <cuda.h>
 
+#define	CEIL(a,b)	((a+b-1)/b)
 #define DATAMB(bytes)			(bytes/1024/1024)
 #define DATABW(bytes,timems)	((float)bytes/(timems * 1.024*1024.0*1024.0))
 
@@ -33,13 +34,13 @@ struct ImgProp{
 
 
 
-// Kernel that flips the given image vertically
+// Vertical flip kernel that works with small block sizes (32768)
 // each thread only flips a single pixel (R,G,B)
 __global__
-void Vflip(uch *ImgDst, uch *ImgSrc, ui Hpixels, ui Vpixels)
+void VfCC20(uch *ImgDst, uch *ImgSrc, ui Hpixels, ui Vpixels, ui LoopID)
 {
 	ui ThrPerBlk = blockDim.x;
-	ui MYbid = blockIdx.x;
+	ui MYbid = (LoopID * 32768) + blockIdx.x;
 	ui MYtid = threadIdx.x;
 	ui MYgtid = ThrPerBlk * MYbid + MYtid;
 
@@ -48,6 +49,7 @@ void Vflip(uch *ImgDst, uch *ImgSrc, ui Hpixels, ui Vpixels)
 	ui MYrow = MYbid / BlkPerRow;
 	ui MYcol = MYgtid - MYrow*BlkPerRow*ThrPerBlk;
 	if (MYcol >= Hpixels) return;			// col out of range
+	if (MYrow >= Vpixels) return;			// row out of range
 	ui MYmirrorrow = Vpixels - 1 - MYrow;
 	ui MYsrcOffset = MYrow       * RowBytes;
 	ui MYdstOffset = MYmirrorrow * RowBytes;
@@ -61,59 +63,19 @@ void Vflip(uch *ImgDst, uch *ImgSrc, ui Hpixels, ui Vpixels)
 }
 
 
-// Kernel that flips the given image horizontally
-// each thread only flips a single pixel (R,G,B)
+// Copy kernel that works with small block sizes (32768)
+// each thread copies only a single byte
 __global__
-void Hflip(uch *ImgDst, uch *ImgSrc, ui Hpixels)
+void PxCC20(uch *ImgDst, uch *ImgSrc, ui FS, ui LoopID)
 {
 	ui ThrPerBlk = blockDim.x;
-	ui MYbid = blockIdx.x;
-	ui MYtid = threadIdx.x;
-	ui MYgtid = ThrPerBlk * MYbid + MYtid;
-
-	ui BlkPerRow = (Hpixels + ThrPerBlk -1 ) / ThrPerBlk;  // ceil
-	ui RowBytes = (Hpixels * 3 + 3) & (~3);
-	ui MYrow = MYbid / BlkPerRow;
-	ui MYcol = MYgtid - MYrow*BlkPerRow*ThrPerBlk;
-	if (MYcol >= Hpixels) return;			// col out of range
-	ui MYmirrorcol = Hpixels - 1 - MYcol;
-	ui MYoffset = MYrow * RowBytes;
-	ui MYsrcIndex = MYoffset + 3 * MYcol;
-	ui MYdstIndex = MYoffset + 3 * MYmirrorcol;
-
-	// swap pixels RGB   @MYcol , @MYmirrorcol
-	ImgDst[MYdstIndex] = ImgSrc[MYsrcIndex];
-	ImgDst[MYdstIndex + 1] = ImgSrc[MYsrcIndex + 1];
-	ImgDst[MYdstIndex + 2] = ImgSrc[MYsrcIndex + 2];
-}
-
-
-// Kernel that copies an image from one part of the
-// GPU memory (ImgSrc) to another (ImgDst)
-__global__
-void PixCopy(uch *ImgDst, uch *ImgSrc, ui FS)
-{
-	ui ThrPerBlk = blockDim.x;
-	ui MYbid = blockIdx.x;
+	ui MYbid = (LoopID * 32768) + blockIdx.x;
 	ui MYtid = threadIdx.x;
 	ui MYgtid = ThrPerBlk * MYbid + MYtid;
 
 	if (MYgtid > FS) return;				// outside the allocated memory
 	ImgDst[MYgtid] = ImgSrc[MYgtid];
 }
-
-
-/*
-// helper function that wraps CUDA API calls, reports any error and exits
-void chkCUDAErr(cudaError_t error_id)
-{
-	if (error_id != CUDA_SUCCESS)
-	{
-		printf("CUDA ERROR :::%\n", cudaGetErrorString(error_id));
-		exit(EXIT_FAILURE);
-	}
-}
-*/
 
 
 // Read a 24-bit/pixel BMP file into a 1D linear array.
@@ -170,22 +132,22 @@ int main(int argc, char **argv)
 	ul SupportedKBlocks, SupportedMBlocks, MaxThrPerBlk;		char SupportedBlocks[100];
 
 
-	strcpy(ProgName, "imflipG");
+	strcpy(ProgName, "imflipG2");
 	switch (argc){
 	case 5:  ThrPerBlk=atoi(argv[4]);
 	case 4:  Flip = toupper(argv[3][0]);
 	case 3:  strcpy(InputFileName, argv[1]);
 			 strcpy(OutputFileName, argv[2]);
 			 break;
-	default: printf("\n\nUsage:   %s InputFilename OutputFilename [V/H/C/T] [ThrPerBlk]", ProgName);
+	default: printf("\n\nUsage:   %s InputFilename OutputFilename [V/C] [ThrPerBlk]", ProgName);
 			 printf("\n\nExample: %s Astronaut.bmp Output.bmp", ProgName);
 			 printf("\n\nExample: %s Astronaut.bmp Output.bmp H", ProgName);
 			 printf("\n\nExample: %s Astronaut.bmp Output.bmp V  128",ProgName);
-			 printf("\n\nH=horizontal flip, V=vertical flip, T=Transpose, C=copy image\n\n");
+			 printf("\n\nV=vertical flip, C=copy image\n\n");
 			 exit(EXIT_FAILURE);
 	}
-	if ((Flip != 'V') && (Flip != 'H') && (Flip != 'C') && (Flip != 'T')) {
-		printf("Invalid flip option '%c'. Must be 'V','H', 'T', or 'C'... \n", Flip);
+	if ((Flip != 'V') && (Flip != 'C')) {
+		printf("Invalid flip option '%c'. Must be 'V' or 'C'... \n", Flip);
 		exit(EXIT_FAILURE);
 	}
 	if ((ThrPerBlk < 32) || (ThrPerBlk > 1024)) {
@@ -251,23 +213,22 @@ int main(int argc, char **argv)
 	//dim3 dimGrid(ip.Hpixels*BlkPerRow);
 
 	BlkPerRow = (IPH + ThrPerBlk -1 ) / ThrPerBlk;
-	NumBlocks = IPV*BlkPerRow; 
+
+	ui NumLoops, L;
 	switch (Flip){
-		case 'H': Hflip <<< NumBlocks, ThrPerBlk >>> (GPUCopyImg, GPUImg, IPH);
+		case 'V': NumBlocks = IPV*BlkPerRow; 
+				  NumLoops = CEIL(NumBlocks,32768);
+				  for (L = 0; L < NumLoops; L++) {
+					  VfCC20 <<< 32768, ThrPerBlk >>> (GPUCopyImg, GPUImg, IPH, IPV, L);
+				  }
 				  GPUResult = GPUCopyImg;
 				  GPUDataTransfer = 2*IMAGESIZE;
 				  break;
-		case 'V': Vflip <<< NumBlocks, ThrPerBlk >>> (GPUCopyImg, GPUImg, IPH, IPV);
-				  GPUResult = GPUCopyImg;
-				  GPUDataTransfer = 2*IMAGESIZE;
-				  break;
-		case 'T': Hflip <<< NumBlocks, ThrPerBlk >>> (GPUCopyImg, GPUImg, IPH);
-				  Vflip <<< NumBlocks, ThrPerBlk >>> (GPUImg, GPUCopyImg, IPH, IPV);
-				  GPUResult = GPUImg;
-				  GPUDataTransfer = 4*IMAGESIZE;
-				  break;
-		case 'C': NumBlocks = (IMAGESIZE+ThrPerBlk-1) / ThrPerBlk;
-				  PixCopy <<< NumBlocks, ThrPerBlk >>> (GPUCopyImg, GPUImg, IMAGESIZE);
+		case 'C': NumBlocks = (IMAGESIZE + ThrPerBlk - 1) / ThrPerBlk;
+				  NumLoops = CEIL(NumBlocks, 32768);
+				  for (L = 0; L < NumLoops; L++) {
+					  PxCC20 <<< 32768, ThrPerBlk >>> (GPUCopyImg, GPUImg, IMAGESIZE, L);
+				  }
 				  GPUResult = GPUCopyImg;
 				  GPUDataTransfer = 2*IMAGESIZE;
 				  break;
